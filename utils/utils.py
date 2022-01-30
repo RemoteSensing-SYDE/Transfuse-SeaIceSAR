@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from icecream import ic
 
 
 class AvgMeter(object):
@@ -22,7 +23,7 @@ class AvgMeter(object):
         self.losses.append(val)
 
     def show(self):
-        return torch.mean(torch.stack(self.losses[np.maximum(len(self.losses)-self.num, 0):]))
+        return torch.mean(torch.stack(self.losses[np.maximum(len(self.losses)-self.num, 0):])).item()
 
 
 class Image_reconstruction(object):
@@ -49,7 +50,7 @@ class Image_reconstruction(object):
         Normalize before calling this method
         '''
 
-        _, num_rows, num_cols = tile.shape
+        num_rows, num_cols, _ = tile.shape
 
         # Percent of overlap between consecutive patches.
         # The overlap will be multiple of 2
@@ -63,7 +64,7 @@ class Image_reconstruction(object):
  
         pad_tuple = ( (overlap//2, overlap//2 + step_row), (overlap//2, overlap//2 + step_col), (0,0) )
         tile_pad = np.pad(tile, pad_tuple, mode = 'symmetric')
-        tile_pad = torch.from_numpy(tile_pad.transpose((3, 0, 1, 2))).float().cuda()
+        tile_pad = torch.from_numpy(tile_pad.transpose((2, 0, 1))).float().cuda()
 
         # Number of patches: k1xk2
         k1, k2 = (num_rows+step_row)//stride, (num_cols+step_col)//stride
@@ -78,11 +79,13 @@ class Image_reconstruction(object):
                 patch = tile_pad[:, i*stride:(i*stride + self.patch_size), j*stride:(j*stride + self.patch_size)]
                 # patch = patch[np.newaxis,...]
                 patch = patch.unsqueeze(0)
-                infer = self.model(patch).detach().cpu().numpy()
+
+                _, _, infer = self.model(patch)
+                infer = infer.detach().cpu().numpy()
 
                 probs[:, i*stride : i*stride+stride, 
-                         j*stride : j*stride+stride, :] = infer[0, :, overlap//2 : overlap//2 + stride, 
-                                                                      overlap//2 : overlap//2 + stride]
+                         j*stride : j*stride+stride] = infer[0, :, overlap//2 : overlap//2 + stride, 
+                                                                   overlap//2 : overlap//2 + stride]
             print('row %d' %(i+1))
 
         # Taken off the padding

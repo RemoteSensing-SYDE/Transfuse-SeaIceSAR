@@ -12,7 +12,81 @@ import albumentations as A
 import cv2
 
 # Added by No@
+# -----------------------------
 import itertools
+import scipy.io as sio
+from icecream import ic
+from sklearn.preprocessing._data import _handle_zeros_in_scale
+import joblib
+
+def filter_outliers(img, bins=2**16-1, bth=0.001, uth=0.999, train_pixels=None):
+    img[np.isnan(img)] = np.mean(img) # Filter NaN values.
+    rows, cols, bands = img.shape
+
+    if train_pixels is None:
+        h = np.arange(0, rows)
+        w = np.arange(0, cols)
+        train_pixels = np.asarray(list(itertools.product(h, w))).transpose()
+
+    min_value, max_value = [], []
+    for band in range(bands):
+        hist = np.histogram(img[train_pixels[0], train_pixels[1], band].ravel(), bins=bins) # select training pixels
+        cum_hist = np.cumsum(hist[0])/hist[0].sum()
+        min_value.append(hist[1][len(cum_hist[cum_hist<bth])])
+        max_value.append(hist[1][len(cum_hist[cum_hist<uth])])
+        
+    return [np.array(min_value), np.array(max_value)]
+
+class Min_Max_Norm_Denorm():
+
+    def __init__(self, img, mask, feature_range=[-1, 1]):
+
+        self.feature_range = feature_range
+        train_pixels = np.asarray(np.where(mask==0))
+
+        self.clips = filter_outliers(img.copy(), bins=2**16-1, bth=0.0005, uth=0.9995, train_pixels=train_pixels)
+        img = self.median_filter(img.copy())
+        
+        self.min_val = np.nanmin(img[train_pixels[0], train_pixels[1]], axis=0)
+        self.max_val = np.nanmax(img[train_pixels[0], train_pixels[1]], axis=0)
+    
+    def median_filter(self, img):
+        kernel_size = 25
+        outliers = (img < self.clips[0]) + (img > self.clips[1])
+        out_idx = np.asarray(np.where(outliers))
+        for i in range(out_idx.shape[1]):
+            x = out_idx[0][i]
+            y = out_idx[1][i]
+            a = x - kernel_size//2 if x - kernel_size//2 >=0 else 0
+            c = y - kernel_size//2 if y - kernel_size//2 >=0 else 0
+            b = x + kernel_size//2 if x + kernel_size//2 <= img.shape[0] else img.shape[0]
+            d = y + kernel_size//2 if y + kernel_size//2 <= img.shape[1] else img.shape[1]
+            img[x, y] = np.median(img[a:b, c:d], axis=(0, 1))
+        
+        return img
+
+    def clip_image(self, img):
+        return np.clip(img.copy(), self.clips[0], self.clips[1])
+
+    def Normalize(self, img):
+        data_range = self.max_val - self.min_val
+        scale = (self.feature_range[1] - self.feature_range[0]) / _handle_zeros_in_scale(data_range)
+        min_ = self.feature_range[0] - self.min_val * scale
+        
+        # img = self.clip_image(img.copy())
+        img = self.median_filter(img.copy())
+        img *= scale
+        img += min_
+        return img
+
+    def Denormalize(self, img):
+        data_range = self.max_val - self.min_val
+        scale = (self.feature_range[1] - self.feature_range[0]) / _handle_zeros_in_scale(data_range)
+        min_ = self.feature_range[0] - self.min_val * scale
+
+        img = img.copy() - min_
+        img /= scale
+        return img
 
 def Split_Image(rows=5989, cols=2985, no_tiles_h=5, no_tiles_w=5):
     '''
@@ -32,16 +106,18 @@ def Split_Image(rows=5989, cols=2985, no_tiles_h=5, no_tiles_w=5):
     if (cols % no_tiles_w): w = w[:-1]
     tiles = list(itertools.product(h, w))
 
-    val_tiles = [1, 3, 7]           # Choose tiles by visual inspection
-                                    # to guaratee all classes in both sets
-                                    # (train and validation)
+    val_tiles = [1, 3, 7]          # Choose tiles by visual inspection
+                                        # to guaratee all classes in both sets
+                                        # (train and validation)
 
-    mask = np.zeros((rows, cols))   # 0 Training Tiles
-                                    # 1 Validation Tiles
+    mask = np.zeros((rows, cols))       # 0 Training Tiles
+                                        # 1 Validation Tiles
     for i in val_tiles:
-        finx = rows if (rows-(i[0] + xsz) < xsz) else (i[0] + xsz)
-        finy = cols if (cols-(i[1] + ysz) < ysz) else (i[1] + ysz)
-        mask[i[0]:finx, i[1]:finy] = 1
+        t = tiles[i]
+        finx = rows if (rows-(t[0] + xsz) < xsz) else (t[0] + xsz)
+        finy = cols if (cols-(t[1] + ysz) < ysz) else (t[1] + ysz)
+        # ic(finx-t[0], finy-t[1])
+        mask[t[0]:finx, t[1]:finy] = 1
     
     return mask
 
@@ -69,7 +145,7 @@ def Split_in_Patches(rows, cols, patch_size, mask, lbl, percent=0, ref_r=0, ref_
     upper_row_pad = (stride - (rows-ref_r) % stride) % stride
     lower_col_pad = (stride - ref_c        % stride) % stride
     upper_col_pad = (stride - (cols-ref_c) % stride) % stride
-    pad_tuple_msk = ( (lower_row_pad, upper_row_pad), (lower_col_pad, upper_col_pad) )
+    pad_tuple_msk = ( (lower_row_pad, upper_row_pad+overlap), (lower_col_pad, upper_col_pad+overlap) )
 
     lbl = np.pad(lbl, pad_tuple_msk, mode = 'symmetric')
     mask_pad = np.pad(mask, pad_tuple_msk, mode = 'symmetric')
@@ -90,7 +166,7 @@ def Split_in_Patches(rows, cols, patch_size, mask, lbl, percent=0, ref_r=0, ref_
 
     for i in range(k1):
         for j in range(k2):
-            if not lbl[i*stride:i*stride + patch_size, j*stride:j*stride + patch_size].any():
+            if lbl[i*stride:i*stride + patch_size, j*stride:j*stride + patch_size].any():
                 # Train
                 if train_mask[i*stride:i*stride + patch_size, j*stride:j*stride + patch_size].all():
                     train_patches.append((i*stride, j*stride))
@@ -114,16 +190,18 @@ class RadarSAT2_Dataset():
     def __init__(self, image_root, gt_root, args, phase="train"):
 
         # Loading Data
-        self.image = np.asarray(Image.open(image_root))
-        # # # # # # RECALL NORMALIZE IMAGE # # # # # #
-        self.gts  = np.asarray(Image.open(gt_root))
+        self.image = sio.loadmat(image_root)
+        self.image = self.image[list(self.image)[-1]]
+
+        self.gts  = sio.loadmat(gt_root)
+        self.gts = self.gts[list(self.gts)[-1]].astype("float")
         self.gts -= 1                           # classes [0; n_clases-1]
-                                                # background = -1
-        
+                                                # background = -1        
         self.background = np.ones_like(self.gts)
         self.background[self.gts < 0] = 0       # Mask to cancel background pixels
                                                 # background = 0
-        
+        self.gts[self.gts<0] = 0
+
         self.classes = ["Background", "Young ice", "First-year ice", "Multi-year ice", "Open water"]
         self.class_colors = np.uint8(np.array([[0, 0, 0],           # Background
                                                [170, 40, 240],      # Young ice
@@ -135,11 +213,13 @@ class RadarSAT2_Dataset():
             self.batch_size = args.batch_size
             self.patch_size = args.patch_size
             self.patch_overlap = args.patch_overlap
+            self.data_info_dir = args.data_info_dir
+            os.makedirs(self.data_info_dir, exist_ok=True)
             
             # Data augmentation
             self.transform = A.Compose(
                 [
-                    A.ShiftScaleRotate(shift_limit=0.15, scale_limit=0.15, rotate_limit=25, p=0.5, border_mode=0),
+                    A.ShiftScaleRotate(shift_limit=0.15, scale_limit=0.15, rotate_limit=25, p=0.5),
                     A.HorizontalFlip(),
                     A.VerticalFlip()
                 ]
@@ -157,16 +237,24 @@ class RadarSAT2_Dataset():
         
         # Split image in Train and validation sets
         rows, cols = self.gts.shape
-        no_tiles_h, no_tiles_w = 5, 5
+        no_tiles_h, no_tiles_w = 5, 3
         mask_train_val = Split_Image(rows=rows, cols=cols, no_tiles_h=no_tiles_h, no_tiles_w=no_tiles_w)
-        save_mask = Image.fromarray(np.uint8(mask_train_val*255))
-        save_mask.save('mask_train_val.tif')
-        np.save('mask_train_val', mask_train_val)
+        Image.fromarray(np.uint8(mask_train_val*255)).save(self.data_info_dir + '/mask_tr_0_vl_1.tif')
+        np.save(self.data_info_dir + '/mask_tr_0_vl_1', mask_train_val)
         
+        # ========= NORMALIZE IMAGE =========
+        self.norm = Min_Max_Norm_Denorm(self.image, mask_train_val)
+        joblib.dump(self.norm, self.data_info_dir + '/norm_params.pkl')
+        self.image = self.norm.Normalize(self.image)
+
         # Extract patches coordinates
-        self.train_patches, 
+        self.train_patches, \
         self.val_patches, _, self.pad_tuple = Split_in_Patches(rows, cols, self.patch_size, mask_train_val,
                                                                self.background, percent=self.patch_overlap)
+        print("--------------")
+        print("Training Patches:   %d"%(len(self.train_patches)))
+        print("Validation Patches: %d"%(len(self.val_patches)))
+        print("--------------")
 
         # Padding
         self.background = np.pad(self.background, self.pad_tuple, mode = 'symmetric')
@@ -183,7 +271,7 @@ class RadarSAT2_Dataset():
             np.random.shuffle(samples)
         elif stage == "validation":
             samples = self.val_patches
-        samples = np.array_split(samples, self.batch_size)
+        samples = np.array_split(samples, np.ceil(len(samples) / self.batch_size))
 
         for i in range(len(samples)):
             images, gts, bckg = [], [], []
@@ -192,17 +280,28 @@ class RadarSAT2_Dataset():
                 gt = self.gts[x : x + self.patch_size, y : y + self.patch_size]
                 bc = self.background[x : x + self.patch_size, y : y + self.patch_size]
 
+                # Image.fromarray(np.uint8((im+self.norm.min_val)*255/(self.norm.max_val-self.norm.min_val))[:,:,:3])\
+                #                                    .save(self.data_info_dir + '/im.tif')
+                # Image.fromarray(np.uint8(gt*255/4)).save(self.data_info_dir + '/gt.tif')
+                # Image.fromarray(np.uint8(bc*255  )).save(self.data_info_dir + '/bc.tif')
+
                 transformed = self.transform(image=im, masks=[gt, bc])
                 im = transformed['image']
                 gt = transformed['masks'][0]
                 bc = transformed['masks'][1]
                 
+                # Image.fromarray(np.uint8((im+self.norm.min_val)*255/(self.norm.max_val-self.norm.min_val))[:,:,:3])\
+                #                                    .save(self.data_info_dir + '/im.tif')
+                # Image.fromarray(np.uint8(gt*255/4)).save(self.data_info_dir + '/gt.tif')
+                # Image.fromarray(np.uint8(bc*255  )).save(self.data_info_dir + '/bc.tif')
+
                 images.append(im)
                 gts.append(gt)
                 bckg.append(bc)
             
             yield np.asarray(images), np.asarray(gts), np.asarray(bckg)
 
+# -----------------------------
 
 
 class SkinDataset(data.Dataset):

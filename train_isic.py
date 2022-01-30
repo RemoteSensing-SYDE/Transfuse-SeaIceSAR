@@ -2,6 +2,7 @@ import torch
 from torch.autograd import Variable
 import argparse
 from datetime import datetime
+import time
 from lib.TransFuse import TransFuse_S
 from utils.dataloader import get_loader, test_dataset, RadarSAT2_Dataset
 from utils.utils import AvgMeter
@@ -26,6 +27,9 @@ def structure_loss_old(pred, mask):
     return (wbce + wiou).mean()
 
 # Added by No@
+from icecream import ic
+from tqdm import tqdm
+
 def structure_loss(pred, mask, bckg):
     # bckg cancel background pixels
     loss = bckg * CrossEntropyLoss(reduction='none')(pred, mask)
@@ -35,30 +39,30 @@ def structure_loss(pred, mask, bckg):
 # def train(train_loader, model, optimizer, epoch, best_loss):
 def train(train_data, model, optimizer, epoch, best_loss, to_torch=True):
 
-    save_path = 'snapshots/{}/'.format(args.train_save)
-    os.makedirs(save_path, exist_ok=True)
-    f = open(save_path + "Log.txt", "a")
+    f = open(args.ckpt_path + "Log.txt", "a")
+    start_time = time.time()
 
     model.train()
     loss_record2, loss_record3, loss_record4 = AvgMeter(), AvgMeter(), AvgMeter()
-    # accum = 0
+
     total_step = len(train_data.train_patches) // train_data.batch_size
     total_step += (len(train_data.train_patches) % train_data.batch_size) > 0
     
     # for i, pack in enumerate(train_loader, start=1):
-    for i, pack in enumerate(train_data.get_batch(stage="train")):
+    gen = enumerate(train_data.get_batch(stage="train"))
+    for i, pack in tqdm(gen):
 
         # ---- data prepare ----
         images, gts, bckg = pack
         if to_torch:
             images  = torch.from_numpy(images.transpose((0, 3, 1, 2))).float()
-            gts     = torch.from_numpy(gts).int()
-            bckg    = torch.from_numpy(bckg).int()
+            gts     = torch.from_numpy(gts).long()
+            bckg    = torch.from_numpy(bckg).float()
         if torch.cuda.is_available():
             images  = images.cuda()
             gts     = gts.cuda()
             bckg    = bckg.cuda()
-
+        
         # ---- forward ----
         lateral_map_4, lateral_map_3, lateral_map_2 = model(images)
 
@@ -77,14 +81,14 @@ def train(train_data, model, optimizer, epoch, best_loss, to_torch=True):
             optimizer.zero_grad()
 
         # ---- recording loss ----
-        loss_record2.update(loss2.data, args.batchsize)
-        loss_record3.update(loss3.data, args.batchsize)
-        loss_record4.update(loss4.data, args.batchsize)
+        loss_record2.update(loss2.data, args.batch_size)
+        loss_record3.update(loss3.data, args.batch_size)
+        loss_record4.update(loss4.data, args.batch_size)
 
         # ---- train visualization ----
-        if i % 20 == 0 or i == total_step or epoch == 0:
-            print_line = 'Tr {} Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], [lateral-2: {:.4f}, lateral-3: {:0.4f}, lateral-4: {:0.4f}]\n'\
-                         .format(datetime.now(), epoch, args.epoch, i, total_step, loss_record2.show(), loss_record3.show(), loss_record4.show())
+        if i % 50 == 0 or i == total_step or epoch == 0:
+            print_line = 'Tr - Epoch [{:03d}], time: [{:04d} segs], Step [{:04d}/{:04d}], [lateral-2: {:.4f}, lateral-3: {:0.4f}, lateral-4: {:0.4f}]\n'\
+                         .format(epoch, int(time.time()-start_time), i, total_step, loss_record2.show(), loss_record3.show(), loss_record4.show())
             print (print_line)
         if epoch == 0: break
 
@@ -92,16 +96,16 @@ def train(train_data, model, optimizer, epoch, best_loss, to_torch=True):
     f.write(print_line)
 
     # Validation
-    meanloss = validation(model, train_data)
-    print_line = 'Vl {} Epoch [{:03d}], [meanloss: {:.4f}]\n'.format(datetime.now(), epoch, meanloss)
+    meanloss, acc = validation(model, train_data)
+    print_line = 'Vl Epoch [{:03d}], [Loss: {:.4f}, Acc: {:.2f}%]\n'.format(epoch, meanloss, acc*100)
     print (print_line)
     f.write(print_line)
     
     if meanloss < best_loss:
         best_loss = meanloss
-        torch.save(model.state_dict(), save_path + 'TransFuse-%d.pth' % epoch)
-        print('[Saving Snapshot:]', save_path + 'TransFuse-%d.pth'% epoch)
-        f.write("===== model saved =====")
+        torch.save(model.state_dict(), args.ckpt_path + 'TransFuse.pth')
+        print('[Saving Snapshot:]', args.ckpt_path + 'TransFuse.pth')
+        f.write("===== model saved =====\n")
         best_model_flag = 1
     else:
         best_model_flag = 0
@@ -110,20 +114,20 @@ def train(train_data, model, optimizer, epoch, best_loss, to_torch=True):
 
     return best_loss, best_model_flag
 
-
-
 def validation(model, data, to_torch=True):
     model.eval()
     loss_bank = []
     acc_bank = []
-    for i, pack in enumerate(data.get_batch(stage="validation")):
+    
+    gen = enumerate(data.get_batch(stage="validation"))
+    for i, pack in tqdm(gen):
 
         # ---- data prepare ----
         images, gts, bckg = pack
         if to_torch:
-            images  = torch.from_numpy(images).float()
-            gts     = torch.from_numpy(gts).int()
-            bckg    = torch.from_numpy(bckg).int()
+            images  = torch.from_numpy(images.transpose((0, 3, 1, 2))).float()
+            gts     = torch.from_numpy(gts).long()
+            bckg    = torch.from_numpy(bckg).float()
         if torch.cuda.is_available():
             images  = images.cuda()
             gts     = gts.cuda()
@@ -145,9 +149,7 @@ def validation(model, data, to_torch=True):
         loss_bank.append(loss.item())
         acc_bank.append(acc)
         
-    print('Loss: {:.4f}, Acc: {:.4f}'.format(np.mean(loss_bank), np.mean(acc_bank)))
-
-    return np.mean(loss_bank)
+    return np.mean(loss_bank), np.mean(acc_bank)
 
 # def test(model, path):
 #     model.eval()
@@ -197,35 +199,41 @@ if __name__ == '__main__':
     parser.add_argument('--epoch', type=int, default=50, help='epoch number')
     parser.add_argument('--patience', type=int, default=10, help='number of epochs after no improvements (stop criteria)')
     parser.add_argument('--lr', type=float, default=7e-5, help='learning rate')
-    parser.add_argument('--batchsize', type=int, default=16, help='training batch size')
+    parser.add_argument('--batch_size', type=int, default=8, help='training batch size')
     parser.add_argument('--patch_size', type=int, default=320, help='patche size (square)')
-    parser.add_argument('--patch_overlap', type=float, default=0.1, help='Overlap between patches')
+    parser.add_argument('--patch_overlap', type=float, default=0.70, help='Overlap between patches')
     parser.add_argument('--n_classes', type=int, default=4, help='Number of classes')
     parser.add_argument('--grad_norm', type=float, default=2.0, help='gradient clipping norm')
 
+    parser.add_argument('--Dataset_dir', type=str,
+                        default='../../Dataset/RADARSAT-2-CP/', help='dataset_path')
     parser.add_argument('--train_path', type=str,
-                        default='data/', help='path to train dataset')
-    parser.add_argument('--test_path', type=str,
-                        default='data/', help='path to test dataset')
-    parser.add_argument('--train_save', type=str, default='TransFuse_S')
+                        default='Scene58/', help='path to train dataset')
+    
+    parser.add_argument('--data_info_dir', type=str, default='data_info')
+    parser.add_argument('--ckpt_path', type=str, default='./checkpoints/TransFuse_S/')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 of adam optimizer')
     parser.add_argument('--beta2', type=float, default=0.999, help='beta2 of adam optimizer')
 
     args = parser.parse_args()
 
-    image_root = '{}/data_train.npy'.format(args.train_path)
-    gt_root = '{}/mask_train.npy'.format(args.train_path)
-    # train_loader = get_loader(image_root, gt_root, batchsize=args.batchsize)
+    image_root = '{}/{}/all_bands.mat'.format(args.Dataset_dir, args.train_path)
+    gt_root = '{}/{}/Model3_CNNPolarIRGS_colored/label_map.mat'.format(args.Dataset_dir, args.train_path)
+    # train_loader = get_loader(image_root, gt_root, batch_size=args.batch_size)
     # total_step = len(train_loader)
     train_data =  RadarSAT2_Dataset(image_root, gt_root, args)
 
     # ---- build models ----
-    model = TransFuse_S(in_chans=train_data.image.shape[3], num_classes=args.n_classes).cuda()
+    model = TransFuse_S(img_size=args.patch_size, in_chans=train_data.image.shape[2], num_classes=args.n_classes).cuda()
     params = model.parameters()
     optimizer = torch.optim.Adam(params, args.lr, betas=(args.beta1, args.beta2))
     
-
     print("#"*20, "Start Training", "#"*20)
+    os.makedirs(args.ckpt_path, exist_ok=True)
+    f = open(args.ckpt_path + "Log.txt", "a")
+    f.write("New run!\n")
+    f.write("{}".format(datetime.now()).split('.')[0] + "\n")
+    f.close()
 
     best_loss = 1e5
     stop_criteria = args.patience

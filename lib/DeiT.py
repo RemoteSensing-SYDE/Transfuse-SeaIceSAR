@@ -55,9 +55,11 @@ def deit_small_patch16_224(pretrained=False, **kwargs):
     pe = model.pos_embed[:, 1:, :].detach()
     pe = pe.transpose(-1, -2)
     pe = pe.view(pe.shape[0], pe.shape[1], int(np.sqrt(pe.shape[2])), int(np.sqrt(pe.shape[2])))
-    pe = F.interpolate(pe, size=(12, 16), mode='bilinear', align_corners=True)
+    # Commented by No@
+    # pe = F.interpolate(pe, size=(12, 16), mode='bilinear', align_corners=True)
     pe = pe.flatten(2)
     pe = pe.transpose(-1, -2)
     model.pos_embed = nn.Parameter(pe)
     model.head = nn.Identity()
     return model
+    
